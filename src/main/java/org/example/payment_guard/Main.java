@@ -6,8 +6,12 @@ import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.consumer.ConsumerRebalanceListener;
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.serialization.StringDeserializer;
+import org.apache.kafka.common.serialization.StringSerializer;
 
 import java.sql.*;
 import java.time.Instant;
@@ -26,6 +30,7 @@ public class Main {
     // ---------- Kafka settings ----------
     private static final String BOOTSTRAP = "13.209.157.53:9092,15.164.111.153:9092,3.34.32.69:9092";
     private static final String TOPIC = "SWIFT";
+    private static final String WIND_ALERT_TOPIC = "AWC_Wind_detect";
     private static final String GROUP_ID = "swift-monitor-main-" + UUID.randomUUID();
 
     // ---------- PostgreSQL settings ----------
@@ -38,6 +43,9 @@ public class Main {
 
     private static final ObjectMapper JSON_MAPPER = new ObjectMapper();
     private static final DateTimeFormatter TIME_FORMAT = DateTimeFormatter.ofPattern("HH:mm:ss").withZone(ZoneId.systemDefault());
+    
+    // Kafka Producer (정적 인스턴스)
+    private static KafkaProducer<String, String> kafkaProducer;
 
     // 풍속 데이터 클래스
     static class WindData {
@@ -57,9 +65,13 @@ public class Main {
     public static void main(String[] args) {
         System.out.println("🛫 SWIFT Aircraft Data Monitor");
         System.out.println("📡 Kafka Cluster: " + BOOTSTRAP);
-        System.out.println("📋 Topic: " + TOPIC);
+        System.out.println("📋 Input Topic: " + TOPIC);
+        System.out.println("📤 Output Topic: " + WIND_ALERT_TOPIC);
         System.out.println("🔄 Group ID: " + GROUP_ID);
         System.out.println("═".repeat(80));
+
+        // Kafka Producer 초기화
+        initializeKafkaProducer();
 
         // Kafka Consumer 구성
         Properties props = new Properties();
@@ -121,7 +133,30 @@ public class Main {
         } catch (Exception e) {
             System.err.println("💥 [FATAL] Application error: " + e.getMessage());
             e.printStackTrace();
+        } finally {
+            // Kafka Producer 정리
+            if (kafkaProducer != null) {
+                kafkaProducer.close();
+                System.out.println("🔄 Kafka Producer closed");
+            }
         }
+    }
+
+    /**
+     * Kafka Producer 초기화
+     */
+    private static void initializeKafkaProducer() {
+        Properties producerProps = new Properties();
+        producerProps.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, BOOTSTRAP);
+        producerProps.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
+        producerProps.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
+        producerProps.put(ProducerConfig.ACKS_CONFIG, "1");
+        producerProps.put(ProducerConfig.RETRIES_CONFIG, 3);
+        producerProps.put(ProducerConfig.BATCH_SIZE_CONFIG, 16384);
+        producerProps.put(ProducerConfig.LINGER_MS_CONFIG, 10);
+        
+        kafkaProducer = new KafkaProducer<>(producerProps);
+        System.out.println("✅ Kafka Producer initialized for topic: " + WIND_ALERT_TOPIC);
     }
 
     /**
@@ -222,6 +257,8 @@ public class Main {
             // 강풍 알림 검사
             if (windData != null && windData.windSpeed >= WIND_ALERT_THRESHOLD) {
                 printWindAlert(callSign, latitude, longitude, altitude, windData, messageCount, currentTime);
+                // Kafka 토픽으로 강풍 알림 전송
+                sendWindAlertToKafka(json, callSign, latitude, longitude, altitude, windData, messageCount, currentTime);
             }
             
         } catch (Exception e) {
@@ -317,5 +354,94 @@ public class Main {
         System.out.println("⚠️  CAUTION: Aircraft flying in high wind conditions!");
         System.out.println("🚨" + "=".repeat(60) + "🚨");
         System.out.println();
+    }
+
+    /**
+     * Kafka로 강풍 알림 전송
+     */
+    private static void sendWindAlertToKafka(JsonNode originalData, String callSign, double latitude, double longitude,
+                                           int altitude, WindData windData, long messageCount, String currentTime) {
+        try {
+            // 강풍 알림 JSON 메시지 생성
+            Map<String, Object> alertMessage = new HashMap<>();
+            
+            // 알림 기본 정보
+            alertMessage.put("alertType", "HIGH_WIND_WARNING");
+            alertMessage.put("alertTime", currentTime);
+            alertMessage.put("messageSequence", messageCount);
+            alertMessage.put("timestamp", System.currentTimeMillis());
+            
+            // 항공기 정보
+            Map<String, Object> aircraftInfo = new HashMap<>();
+            aircraftInfo.put("callSign", callSign);
+            aircraftInfo.put("latitude", latitude);
+            aircraftInfo.put("longitude", longitude);
+            aircraftInfo.put("altitude", altitude);
+            
+            // 원본 데이터에서 추가 정보 추출
+            JsonNode flightPlan = originalData.path("flightPlan");
+            if (!flightPlan.isMissingNode()) {
+                aircraftInfo.put("aircraftType", flightPlan.path("aircraftType").asText("N/A"));
+                aircraftInfo.put("flightRules", flightPlan.path("flightRules").asText("N/A"));
+                aircraftInfo.put("assignedAltitude", flightPlan.path("assignedAltitude").asInt(0));
+            }
+            
+            JsonNode enhanced = originalData.path("enhanced");
+            if (!enhanced.isMissingNode()) {
+                aircraftInfo.put("departureAirport", enhanced.path("departureAirport").asText("N/A"));
+                aircraftInfo.put("destinationAirport", enhanced.path("destinationAirport").asText("N/A"));
+            }
+            
+            JsonNode track = originalData.path("track");
+            if (!track.isMissingNode()) {
+                aircraftInfo.put("verticalVelocity", track.path("verticalVelocity").asInt(0));
+                aircraftInfo.put("status", track.path("status").asText("N/A"));
+                aircraftInfo.put("beaconCode", track.path("beaconCode").asText("N/A"));
+            }
+            
+            alertMessage.put("aircraft", aircraftInfo);
+            
+            // 기상 정보
+            Map<String, Object> weatherInfo = new HashMap<>();
+            weatherInfo.put("nearestStationCode", windData.stationCode);
+            weatherInfo.put("nearestStationName", windData.stationName);
+            weatherInfo.put("distanceToStation(mile)", Math.round(windData.distance * 100.0) / 100.0); // 소수점 2자리
+            weatherInfo.put("windSpeed", windData.windSpeed);
+            weatherInfo.put("windSpeedUnit", "knots");
+            weatherInfo.put("alertThreshold", WIND_ALERT_THRESHOLD);
+            
+            alertMessage.put("weather", weatherInfo);
+            
+            // 위험 레벨
+            String riskLevel;
+            if (windData.windSpeed >= 35) {
+                riskLevel = "SEVERE";
+            } else if (windData.windSpeed >= 25) {
+                riskLevel = "HIGH";
+            } else {
+                riskLevel = "MODERATE";
+            }
+            alertMessage.put("riskLevel", riskLevel);
+            
+            // JSON 문자열로 변환
+            String jsonMessage = JSON_MAPPER.writeValueAsString(alertMessage);
+            
+            // Kafka로 전송
+            ProducerRecord<String, String> record = new ProducerRecord<>(WIND_ALERT_TOPIC, callSign, jsonMessage);
+            
+            kafkaProducer.send(record, (metadata, exception) -> {
+                if (exception != null) {
+                    System.err.println("❌ [KAFKA ERROR] Failed to send wind alert: " + exception.getMessage());
+                } else {
+                    System.out.println("📤 [KAFKA] Wind alert sent to topic: " + metadata.topic() + 
+                                     " | Partition: " + metadata.partition() + 
+                                     " | Offset: " + metadata.offset());
+                }
+            });
+            
+        } catch (Exception e) {
+            System.err.println("❌ [KAFKA SEND ERROR] " + e.getMessage());
+            e.printStackTrace();
+        }
     }
 }
