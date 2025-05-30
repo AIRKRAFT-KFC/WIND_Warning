@@ -229,7 +229,7 @@ public class Main {
     }
 
     /**
-     * 항공기 강풍 위험 감지
+     * 항공기 강풍 위험 감지 (SEVERE만 처리)
      */
     private static void checkWindAlert(JsonNode json, long messageCount, String currentTime) {
         try {
@@ -254,15 +254,15 @@ public class Main {
             // DB에서 해당 위치의 풍속 조회
             WindData windData = getWindSpeedAtLocation(latitude, longitude, altitude);
             
-            // 강풍 알림 검사
-            if (windData != null && windData.windSpeed >= WIND_ALERT_THRESHOLD) {
+            // SEVERE 위험도만 처리 (35노트 이상)
+            if (windData != null && windData.windSpeed >= 35) {
                 printWindAlert(callSign, latitude, longitude, altitude, windData, messageCount, currentTime);
-                // Kafka 토픽으로 강풍 알림 전송
+                // Kafka 토픽으로 SEVERE 알림만 전송
                 sendWindAlertToKafka(json, callSign, latitude, longitude, altitude, windData, messageCount, currentTime);
             }
             
         } catch (Exception e) {
-            System.err.println("❌ [WIND CHECK ERROR] " + e.getMessage());
+            System.err.println("❌ [SEVERE WIND CHECK ERROR] " + e.getMessage());
         }
     }
 
